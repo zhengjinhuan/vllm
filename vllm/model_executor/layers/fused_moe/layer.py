@@ -1039,7 +1039,7 @@ class FusedMoE(CustomOp):
     ):
         super().__init__()
 
-        self.se_stream = torch.cuda.Stream()
+        self.shared_experts_stream = torch.cuda.Stream()
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -1276,6 +1276,10 @@ class FusedMoE(CustomOp):
 
     @property
     def shared_experts(self) -> Optional[torch.nn.Module]:
+        return None
+
+    @property
+    def gate(self) -> Optional[torch.nn.Module]:
         return None
 
     @property
@@ -2114,8 +2118,8 @@ class FusedMoE(CustomOp):
                 and self.shared_experts is not None
             ):
                 current_stream = torch.cuda.current_stream()
-                self.se_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.se_stream):
+                self.shared_experts_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.shared_experts_stream):
                     shared_output = self.shared_experts(staged_hidden_states)
 
             else:
@@ -2148,7 +2152,7 @@ class FusedMoE(CustomOp):
                 assert not isinstance(final_hidden_states, tuple)
                 assert self.shared_experts is not None
 
-                current_stream.wait_stream(self.se_stream)
+                current_stream.wait_stream(self.shared_experts_stream)
 
                 final_hidden_states = (
                     shared_output,
@@ -2219,6 +2223,16 @@ class FusedMoE(CustomOp):
 
         self.ensure_moe_quant_config()
 
+        use_explicit_se = (
+            not isinstance(self.quant_method.fused_experts, FusedMoEModularKernel)
+            and self.shared_experts is not None
+        )
+        if use_explicit_se:
+            current_stream = torch.cuda.current_stream()
+            self.shared_experts_stream.wait_stream(current_stream)
+
+        router_logits, _ = self.gate(hidden_states)
+
         # Route to the chunked forward path using the FlashInfer Cutlass kernel
         # only when data parallelism (DP) is enabled.
         _use_flashinfer_cutlass_kernels = (
@@ -2240,13 +2254,8 @@ class FusedMoE(CustomOp):
 
         # If there are shared experts but we are not using a modular kernel, the
         # shared experts must be called here
-        if (
-            not isinstance(self.quant_method.fused_experts, FusedMoEModularKernel)
-            and self.shared_experts is not None
-        ):
-            current_stream = torch.cuda.current_stream()
-            self.se_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self.se_stream):
+        if use_explicit_se:
+            with torch.cuda.stream(self.shared_experts_stream):
                 shared_output = self.shared_experts(hidden_states)
         else:
             shared_output = None
@@ -2292,7 +2301,8 @@ class FusedMoE(CustomOp):
                 assert not isinstance(final_hidden_states, tuple)
                 assert self.shared_experts is not None
 
-                current_stream.wait_stream(self.se_stream)
+                current_stream = torch.cuda.current_stream()
+                current_stream.wait_stream(self.shared_experts_stream)
 
                 final_hidden_states = (
                     shared_output,
